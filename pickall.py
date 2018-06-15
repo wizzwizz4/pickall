@@ -10,6 +10,7 @@ __all__ = pickle.__all__
 PickleError = pickle.PickleError
 PicklingError = pickle.PicklingError
 UnpicklingError = pickle.UnpicklingError
+Unpickler = pickle.Unpickler
 
 # Add SHOUTY_VARIABLES from pickle's globals
 globals().update({k: v for k, v in vars(pickle).items()
@@ -67,6 +68,9 @@ resolvable_location = {
     functools._CacheInfo: ('functools', '_CacheInfo')
 }
 
+def __newobj__(cls, *args):
+    return cls.__new__(cls, *args)
+
 class _Pickler(pickle._Pickler):
     # dispatch is a dictionary where the keys are the type of object
     # and the values are save_x methods.
@@ -101,12 +105,10 @@ class _Pickler(pickle._Pickler):
         func = types.FunctionType
         if self.proto >= 2:
             # __newobj__ is supported
-            def __newobj__(cls, *args):
-                return cls.__new__(cls, *args)
             func = __newobj__
         return self.save_reduce(
             func,
-            (obj.__code__, obj.__globals__,
+            (types.FunctionType, obj.__code__, obj.__globals__,
              # Afaik, function() copes with the optional arguments being
              # the default "empty" values.
              obj.__name__, obj.__defaults__, obj.__closure__),
@@ -117,9 +119,44 @@ class _Pickler(pickle._Pickler):
         )
     dispatch[types.FunctionType] = save_function
 
+    def save_code(self, obj):
+        # This one's much easier than function.
+        func = types.CodeType
+        if self.proto >= 2:
+            # __newobj__ is supported
+            func = __newobj__
+        return self.save_reduce(
+            func,
+            (types.CodeType, obj.co_argcount, obj.co_kwonlyargcount,
+             obj.co_nlocals, obj.co_stacksize, obj.co_flags, obj.co_code,
+             obj.co_consts, obj.co_names, obj.co_varnames, obj.co_filename,
+             obj.co_name, obj.co_firstlineno, obj.co_lnotab, obj.co_freevars,
+             obj.co_cellvars)
+        )
+    dispatch[types.CodeType] = save_code
 
 def whichmodule(obj, name):
     if obj in resolvable_location:
         # resolvable_location[obj][1] should == name
         return resolvable_location[obj][0]
     return pickle.whichmodule(obj, name)
+
+# Shorthands
+_dump = _duplicate(pickle._dump)
+_dumps = _duplicate(pickle._dumps)
+_load = _duplicate(pickle._load)
+_loads = _duplicate(pickle._loads)
+
+# Use the faster _pickall if I ever get around to writing it
+# Use the faster _pickle if possible
+try:
+    from _pickall import (
+        Pickler,
+        dump,
+        dumps,
+        load,
+        loads
+    )
+except ImportError:
+    Pickler = _Pickler
+    dump, dumps, load, loads = _dump, _dumps, _load, _loads
