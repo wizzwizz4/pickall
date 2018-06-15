@@ -3,7 +3,7 @@ import types
 import re
 import io
 import builtins
-import sys
+import functools
 
 # Ensure that pickall has the same interface as pickle
 __all__ = pickle.__all__
@@ -37,22 +37,42 @@ class _DuplicateGlobals(dict):
 def _duplicate(func, globals_=_DuplicateGlobals(globals(), vars(pickle))):
     # Replace the functions with versions that use this module's globals in
     # preference to this function's globals.
-    return types.FunctionType(
+    new_func = types.FunctionType(
         func.__code__,
         globals_,
         func.__name__,
         func.__defaults__,
         func.__closure__
     )
+    new_func.__annotations__ = func.__annotations__
+    new_func.__kwdefaults__ = func.__kwdefaults__
+    return new_func
 
+# Map of object to (module_name, qualname)
+# Currently built for CPython; I might add dynamic collection back in later
+# but my current implementation is flawed.
+resolvable_location = {
+    types.BuiltinFunctionType: ('types', 'BuiltinFunctionType'),
+    types.CodeType: ('types', 'CodeType'),
+    types.CoroutineType: ('types', 'CoroutineType'),
+    types.FrameType: ('types', 'FrameType'),
+    types.FunctionType: ('types', 'FunctionType'),
+    types.GeneratorType: ('types', 'GeneratorType'),
+    types.GetSetDescriptorType: ('types', 'GetSetDescriptorType'),
+    types.MappingProxyType: ('types', 'MappingProxyType'),
+    types.MemberDescriptorType: ('types', 'MemberDescriptorType'),
+    types.MethodType: ('types', 'MethodType'),
+    types.ModuleType: ('types', 'ModuleType'),
+    types.TracebackType: ('types', 'TracebackType'),
+    functools._CacheInfo: ('functools', '_CacheInfo')
+}
 
 class _Pickler(pickle._Pickler):
     # dispatch is a dictionary where the keys are the type of object
     # and the values are save_x methods.
     dispatch = pickle._Pickler.dispatch.copy()
-    del dispatch[types.FunctionType]
 
-    def save_type(self, obj, *args, **kwargs):
+    def save_type(self, obj):
         # save_type is called to save all instances of type.
         # This includes the types.XyzType types.
         
@@ -62,11 +82,8 @@ class _Pickler(pickle._Pickler):
         # code with a special case to avoid calling the dispatch for the
         # class.
         
-        if obj in map(vars(types).__getitem__, types.__all__):
-            # Using sorted()[0] is slower than using next(),
-            # but it's deterministic in cases like function.
-            name = sorted(k for k, v in vars(types).items()
-                          if v is obj)[0]
+        if obj in resolvable_location:
+            name = resolvable_location[obj][1]
             
             # I'm calling save_global here because I want this to work
             # even if the pickle protocol optimises this; if I implemented this
@@ -74,25 +91,35 @@ class _Pickler(pickle._Pickler):
             # This means that I have to also override whichmodule, which means
             # that I have to _duplicate save_global.
             return self.save_global(obj, name=name)
-        return super().save_type(obj, *args, **kwargs)
+        return super().save_type(obj)
     dispatch[type] = save_type  # Mustn't forget this!
 
     # For explanation, see comments in save_type
     save_global = _duplicate(pickle._Pickler.save_global)
 
-def _getattr(obj, name, default):
-    """A version of getattr that looks up __qualname__"""
-    try:
-        pickle._getattribute(obj, name)
-    except AttributeError:
-        return default
+    def save_function(self, obj):
+        func = types.FunctionType
+        if self.proto >= 2:
+            # __newobj__ is supported
+            def __newobj__(cls, *args):
+                return cls.__new__(cls, *args)
+            func = __newobj__
+        return self.save_reduce(
+            func,
+            (obj.__code__, obj.__globals__,
+             # Afaik, function() copes with the optional arguments being
+             # the default "empty" values.
+             obj.__name__, obj.__defaults__, obj.__closure__),
+            state={
+                '__annotations__': obj.__annotations__,
+                '__kwdefaults__': obj.__kwdefaults__
+            }
+        )
+    dispatch[types.FunctionType] = save_function
+
 
 def whichmodule(obj, name):
-    # None doesn't have an attribute __module__, so it can safely be used
-    # as a default.
-    if hasattr(obj, '__module__') and _getattr(sys.modules[obj.__module__],
-                                               name, None) is not obj:
-        for module_name, module in (('types', types),):
-            if _getattr(module, name, None) is obj:
-                return module_name
+    if obj in resolvable_location:
+        # resolvable_location[obj][1] should == name
+        return resolvable_location[obj][0]
     return pickle.whichmodule(obj, name)
