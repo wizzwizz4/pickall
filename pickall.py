@@ -4,6 +4,7 @@ import re
 import io
 import builtins
 import functools
+import copyreg
 
 # Ensure that pickall has the same interface as pickle
 __all__ = pickle.__all__
@@ -16,21 +17,28 @@ Unpickler = pickle.Unpickler
 globals().update({k: v for k, v in vars(pickle).items()
                   if re.match("[A-Z][A-Z0-9_]+$", k)})
 
-# Function duplication magic.
-class _DuplicateGlobals(dict):
+class _ChainedDictionary(dict):
     """A chained dictionary implementation."""
-    def __init__(self, *globalss,
-                 set_globals=None, builtins=vars(builtins)):
-        if set_globals is None:
-            set_globals = globalss[0]
-        self._set_globals = set_globals
-        self._globalss = globalss + (builtins,)
+    def __init__(self, *dictionaries):
+        super().__init__()
+        self._dictionaries = dictionaries
 
     def __getitem__(self, key):
-        for globals_ in self._globalss:
-            if key in globals_:
-                return globals_[key]
-        raise KeyError("Key {} not in any of the globalss.".format(key))
+        if key in self:
+            return super().__getitem__(key)
+        for dictionary in self._dictionaries:
+            if key in dictionary:
+                return dictionary[key]
+        raise KeyError("Key {} not in any of the dictionaries.".format(key))
+
+# Function duplication magic.
+class _DuplicateGlobals(_ChainedDictionary):
+    def __init__(self, *dictionaries,
+                 set_globals=None, builtins=vars(builtins)):
+        if set_globals is None:
+            set_globals = dictionaries[0]
+        self._set_globals = set_globals
+        super().__init__(*dictionaries, builtins)
 
     def __setitem__(self, key, value):
         self._set_globals[key] = value
@@ -47,7 +55,11 @@ def _duplicate(func, globals_=_DuplicateGlobals(globals(), vars(pickle))):
     )
     new_func.__annotations__ = func.__annotations__
     new_func.__kwdefaults__ = func.__kwdefaults__
+    new_func.__doc__ = func.__doc__
     return new_func
+
+def _no_globals(func):
+    return _duplicate(func, {})
 
 # Map of object to (module_name, qualname)
 # Currently built for CPython; I might add dynamic collection back in later
@@ -68,6 +80,7 @@ resolvable_location = {
     functools._CacheInfo: ('functools', '_CacheInfo')
 }
 
+@_no_globals
 def __newobj__(cls, *args):
     return cls.__new__(cls, *args)
 
@@ -75,6 +88,7 @@ class _Pickler(pickle._Pickler):
     # dispatch is a dictionary where the keys are the type of object
     # and the values are save_x methods.
     dispatch = pickle._Pickler.dispatch.copy()
+    del dispatch[types.FunctionType]  # Don't treat it as a global
 
     def save_type(self, obj):
         # save_type is called to save all instances of type.
@@ -105,6 +119,8 @@ class _Pickler(pickle._Pickler):
         func = types.FunctionType
         if self.proto >= 2:
             # __newobj__ is supported
+            # Since __newobj__ is a function, this MUST not be used
+            # unless __newobj__ will definitely not actually be pickled.
             func = __newobj__
         return self.save_reduce(
             func,
@@ -112,6 +128,7 @@ class _Pickler(pickle._Pickler):
              # Afaik, function() copes with the optional arguments being
              # the default "empty" values.
              obj.__name__, obj.__defaults__, obj.__closure__),
+            # This doesn't actually work at the moment
             state={
                 '__annotations__': obj.__annotations__,
                 '__kwdefaults__': obj.__kwdefaults__
@@ -119,21 +136,17 @@ class _Pickler(pickle._Pickler):
         )
     dispatch[types.FunctionType] = save_function
 
-    def save_code(self, obj):
-        # This one's much easier than function.
-        func = types.CodeType
-        if self.proto >= 2:
-            # __newobj__ is supported
-            func = __newobj__
-        return self.save_reduce(
-            func,
-            (types.CodeType, obj.co_argcount, obj.co_kwonlyargcount,
-             obj.co_nlocals, obj.co_stacksize, obj.co_flags, obj.co_code,
-             obj.co_consts, obj.co_names, obj.co_varnames, obj.co_filename,
-             obj.co_name, obj.co_firstlineno, obj.co_lnotab, obj.co_freevars,
-             obj.co_cellvars)
-        )
-    dispatch[types.CodeType] = save_code
+    # dispatch_table is a registry of reduction functions
+    dispatch_table = _ChainedDictionary(copyreg.dispatch_table)
+
+    # This one's much easier than function.
+    dispatch_table[types.CodeType] = lambda c: (
+        __newobj__,
+        (types.CodeType, c.co_argcount, c.co_kwonlyargcount, c.co_nlocals,
+         c.co_stacksize, c.co_flags, c.co_code, c.co_consts, c.co_names,
+         c.co_varnames, c.co_filename, c.co_name, c.co_firstlineno,
+         c.co_lnotab, c.co_freevars, c.co_cellvars)
+    )
 
 def whichmodule(obj, name):
     if obj in resolvable_location:
