@@ -36,6 +36,22 @@ class FunctionPicklingTestCase(unittest.TestCase):
                 self.assertEqual(original(1, 2, 3, test=4),
                                  new_func(1, 2, 3, test=4))
 
+    def test_isolated_function_dictionary(self):
+        @pickall._no_globals
+        def original():
+            pass
+        original.a = "this is a"
+        original.b = "this is b"
+        original.c = ("this is a complex", "value for c")
+
+        pickle_string = pickall.dumps(original)
+        new_func = pickle.loads(pickle_string)
+
+        for attribute in 'abc':
+            with self.subTest(attribute=attribute):
+                self.assertEqual(getattr(original, attribute),
+                                 getattr(new_func, attribute))
+
 # Undocumented
 class _duplicateTestCase(unittest.TestCase):
     def test_optional_kwonly(self):

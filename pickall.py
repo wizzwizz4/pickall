@@ -129,10 +129,19 @@ class _Pickler(pickle._Pickler):
              # the default "empty" values.
              obj.__name__, obj.__defaults__, obj.__closure__),
             # This doesn't actually work at the moment
-            state={
-                '__annotations__': obj.__annotations__,
-                '__kwdefaults__': obj.__kwdefaults__
-            }
+            state=vars(obj)
+
+            # Todo: To fix #2, add opcodes to make a tuple work,
+            # add a no_globals helper function that takes the new function
+            # and its __annotations__ and __kwdefaults__ values, and
+            # adds them to it. Make a tuple and use R to call it.
+            # Since it's mutating the same object, memoing should not be
+            # affected. If it returns the function too, it can be a drop-in
+            # replacement since there'll be no net effect on the stack.
+            ##{
+            ##    '__annotations__': obj.__annotations__,
+            ##    '__kwdefaults__': obj.__kwdefaults__
+            ##}
         )
     dispatch[types.FunctionType] = save_function
 
