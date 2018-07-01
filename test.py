@@ -52,6 +52,26 @@ class FunctionPicklingTestCase(unittest.TestCase):
                 self.assertEqual(getattr(original, attribute),
                                  getattr(new_func, attribute))
 
+    def test_isolated_closure(self):
+        def wrapper():
+            x = 0
+            @pickall._no_globals
+            def original():
+                nonlocal x
+                x += 1
+                return x, y
+            y = 24
+            return original
+        original = wrapper()
+
+        pickle_string = pickall.dumps(original)
+        new_func = pickle.loads(pickle_string)
+
+        for i in range(100):
+            with self.subTest(call_n=i):
+                self.assertEqual(original(),
+                                 new_func())
+
 # Undocumented
 class _duplicateTestCase(unittest.TestCase):
     def test_optional_kwonly(self):

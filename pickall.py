@@ -5,6 +5,7 @@ import io
 import builtins
 import functools
 import copyreg
+import ctypes
 
 # Ensure that pickall has the same interface as pickle
 __all__ = pickle.__all__
@@ -12,6 +13,12 @@ PickleError = pickle.PickleError
 PicklingError = pickle.PicklingError
 UnpicklingError = pickle.UnpicklingError
 Unpickler = pickle.Unpickler
+
+# Get references to types without any __qualname__-like reference
+def closure_container(x=None):
+    return type((lambda:x).__closure__[0])
+cell = closure_container()
+del closure_container
 
 # Add SHOUTY_VARIABLES from pickle's globals
 globals().update({k: v for k, v in vars(pickle).items()
@@ -98,6 +105,67 @@ class _Pickler(pickle._Pickler):
     dispatch = pickle._Pickler.dispatch.copy()
     del dispatch[types.FunctionType]  # Don't treat it as a global
 
+    def save_function_call(self, func, *args):
+        """Save a function and arguments, then call the function.
+        
+        The first argument should be a callable.
+        
+        Each subsequent argument should be a tuple containing an int and
+        some number of other items.
+        When the int is 0, there should be just one other item of the tuple,
+        which is the argument to be passed to the function.
+        When the int is 1, the subsequent items of the tuple represent the
+        arguments passed to save_function_call; it means that one of the
+        arguments passed to the function is a function call.
+        When it's 2, the arguments should be a function, then an args tuple;
+        this should be a function that when called with *args pushes one item
+        onto the pickle stack. Alas, we all know that what _should be_, and
+        what _is_, are two different things. Just please don't write an
+        unmatched MARK.
+        
+        More observant readers may have noticed that 1 is just a special case
+        of 2; this is technically true but it's a lot more useful to be able
+        to write nested function calls with only one level of nested tuples
+        instead of 2. Also, these readers may have noticed that magic numbers
+        as opposed to enums or PSEUDO_CONSTANTS have been used here. This is to
+        discourage people from using what is basically a utility function for
+        a last-resort hackish, hackish way of pickling.
+        """
+        self.save(func)
+        if not args:
+            self.save_tuple(())  # No point reimplementing this logic
+        
+        if self.proto >= 2 and len(args) <= 3:
+            pass  # TUPLE1, TUPLE2 and TUPLE3 can be used.
+        else:
+            # Start a variable-length tuple
+            self.write(MARK)
+
+        for mode, arg in args:
+            if mode == 0:
+                # No special mode.
+                self.save(arg)
+                continue
+            if mode == 1:
+                self.save_function_call(*arg)
+                continue
+            if mode == 2:
+                # Structured like this to support the possibility of adding
+                # **kwargs in future; this is restricted by self.proto and I
+                # don't know what to do if it isn't supported so haven't
+                # implemented it.
+                f, f_args = arg
+                f(*f_args)
+                continue
+            raise ValueError("{} is not a valid mode".format(mode))
+
+        if self.proto >= 2 and len(args) <= 3:
+            # Write TUPLE1, TUPLE2 or TUPLE3
+            self.write(pickle._tuplesize2code[len(args)])
+        else:
+            # End a variable-length tuple
+            self.write(TUPLE)
+
     def save_type(self, obj):
         # save_type is called to save all instances of type.
         # This includes the types.XyzType types.
@@ -176,6 +244,16 @@ class _Pickler(pickle._Pickler):
                                 # because it's still the same object.
     dispatch[types.FunctionType] = save_function
 
+    def save_cell(self, obj):
+        self.save_function_call(
+            ctypes.cast, (1,
+                ctypes.pythonapi.PyCell_Get, (1,
+                    ctypes.py_object, (0, obj.cell_contents)
+                )
+            )
+        )
+    dispatch[cell] = save_cell
+
     # dispatch_table is a registry of reduction functions
     dispatch_table = _ChainedDictionary(copyreg.dispatch_table)
 
@@ -187,6 +265,7 @@ class _Pickler(pickle._Pickler):
          c.co_varnames, c.co_filename, c.co_name, c.co_firstlineno,
          c.co_lnotab, c.co_freevars, c.co_cellvars)
     )
+
 
 def whichmodule(obj, name):
     if obj in resolvable_location:
