@@ -84,6 +84,14 @@ resolvable_location = {
 def __newobj__(cls, *args):
     return cls.__new__(cls, *args)
 
+# For function pickling
+@_no_globals
+def set_function_descriptors(f, annotations, kwdefaults):
+    # WARNING: Must NOT have __annotations__ or __kwdefaults__!
+    f.__annotations__ = annotations
+    f.__kwdefaults__ = kwdefaults
+    return f
+
 class _Pickler(pickle._Pickler):
     # dispatch is a dictionary where the keys are the type of object
     # and the values are save_x methods.
@@ -122,33 +130,56 @@ class _Pickler(pickle._Pickler):
             # Since __newobj__ is a function, this MUST not be used
             # unless __newobj__ will definitely not actually be pickled.
             func = __newobj__
-        return self.save_reduce(
+
+        # Since __annotations__ and __kwdefaults__ are implemented as
+        # descriptors, but aren't provided as arguments, they can't be
+        # set in any way that pickle natively supports. Pickle does, however,
+        # support arbitrary code execution.
+        has_descriptors = bool(obj.__annotations__) or bool(obj.__kwdefaults__)
+        if has_descriptors:
+            # Save function, then arguments.
+            self.save(set_function_descriptors)
+            # Arguments have to be a tuple, which must include the function...
+            # Manually constructing a tuple is easiest.
+            if self.proto >= 2:
+                # As there are only three arguments (obj, annnot, kwdef),
+                # TUPLE3 can be used.
+                # This involves simply pushing the items to the stack.
+                pass
+            else:
+                # We have to use variable-length tuple code.
+                self.write(MARK)
+            
+        self.save_reduce(
             func,
             (types.FunctionType, obj.__code__, obj.__globals__,
              # Afaik, function() copes with the optional arguments being
              # the default "empty" values.
              obj.__name__, obj.__defaults__, obj.__closure__),
-            # This doesn't actually work at the moment
             state=vars(obj)
-
-            # Todo: To fix #2, add opcodes to make a tuple work,
-            # add a no_globals helper function that takes the new function
-            # and its __annotations__ and __kwdefaults__ values, and
-            # adds them to it. Make a tuple and use R to call it.
-            # Since it's mutating the same object, memoing should not be
-            # affected. If it returns the function too, it can be a drop-in
-            # replacement since there'll be no net effect on the stack.
-            ##{
-            ##    '__annotations__': obj.__annotations__,
-            ##    '__kwdefaults__': obj.__kwdefaults__
-            ##}
+            # Can't put __annotations__ and __kwdefaults__ here, since
+            # they're descriptors that don't match a constructor argument.
         )
+
+        if has_descriptors:
+            self.save(obj.__annotations__)
+            self.save(obj.__kwdefaults__)
+            if self.proto >= 2:
+                # Same as above; TUPLE3 can be used.
+                self.write(TUPLE3)
+            else:
+                self.write(TUPLE)
+            # Don't memoize because this isn't a real tuple,
+            # so nothing else will reference it.
+            self.write(REDUCE)  # Mutate the function object;
+                                # new version is automatically in the memo
+                                # because it's still the same object.
     dispatch[types.FunctionType] = save_function
 
     # dispatch_table is a registry of reduction functions
     dispatch_table = _ChainedDictionary(copyreg.dispatch_table)
 
-    # This one's much easier than function.
+    # This one's MUCH easier than function.
     dispatch_table[types.CodeType] = lambda c: (
         __newobj__,
         (types.CodeType, c.co_argcount, c.co_kwonlyargcount, c.co_nlocals,
