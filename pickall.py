@@ -71,7 +71,7 @@ def _no_globals(func):
 # Map of object to (module_name, qualname)
 # Currently built for CPython; I might add dynamic collection back in later
 # but my current implementation is flawed.
-resolvable_location = {
+_resolvable_location = {
     types.BuiltinFunctionType: ('types', 'BuiltinFunctionType'),
     types.CodeType: ('types', 'CodeType'),
     types.CoroutineType: ('types', 'CoroutineType'),
@@ -84,8 +84,20 @@ resolvable_location = {
     types.MethodType: ('types', 'MethodType'),
     types.ModuleType: ('types', 'ModuleType'),
     types.TracebackType: ('types', 'TracebackType'),
-    functools._CacheInfo: ('functools', '_CacheInfo')
+    functools._CacheInfo: ('functools', '_CacheInfo'),
+    ctypes.pythonapi._FuncPtr: ('ctypes', 'pythonapi._FuncPtr'),
 }
+
+def resolve_location(obj):
+    try:
+        contains = obj in _resolvable_location
+    except Exception:
+        pass
+    else:
+        if contains:
+            return _resolvable_location[obj]
+    # More rules go here, if needed.
+    return None
 
 @_no_globals
 def __newobj__(cls, *args):
@@ -141,10 +153,10 @@ class _Pickler(pickle._Pickler):
             # Start a variable-length tuple
             self.write(MARK)
 
-        for mode, arg in args:
+        for mode, *arg in args:
             if mode == 0:
                 # No special mode.
-                self.save(arg)
+                self.save(arg[0])
                 continue
             if mode == 1:
                 self.save_function_call(*arg)
@@ -175,16 +187,17 @@ class _Pickler(pickle._Pickler):
         # and I'd just be reprogramming the existing object pickling
         # code with a special case to avoid calling the dispatch for the
         # class.
-        
-        if obj in resolvable_location:
-            name = resolvable_location[obj][1]
+
+        location = resolve_location(obj)
+        if location is not None:
+            qualname = location[1]
             
             # I'm calling save_global here because I want this to work
             # even if the pickle protocol optimises this; if I implemented this
             # here using self.write it would be using protocol 4 max.
             # This means that I have to also override whichmodule, which means
             # that I have to _duplicate save_global.
-            return self.save_global(obj, name=name)
+            return self.save_global(obj, name=qualname)
         return super().save_type(obj)
     dispatch[type] = save_type  # Mustn't forget this!
 
@@ -192,6 +205,15 @@ class _Pickler(pickle._Pickler):
     save_global = _duplicate(pickle._Pickler.save_global)
 
     def save_function(self, obj):
+        # TODO: Be able to remove me!
+        if obj.__module__ in ('ctypes',):
+            try:
+                self.save_global(obj)
+            except PicklingError:
+                print("ASSUMPTION IN save_function({}) FAILED!".format(obj))
+                pass
+            return
+        
         func = types.FunctionType
         if self.proto >= 2:
             # __newobj__ is supported
@@ -239,7 +261,7 @@ class _Pickler(pickle._Pickler):
                 self.write(TUPLE)
             # Don't memoize because this isn't a real tuple,
             # so nothing else will reference it.
-            self.write(REDUCE)  # Mutate the function object;
+            self.write(REDUCE)  # Mutate the function object with set_funct...;
                                 # new version is automatically in the memo
                                 # because it's still the same object.
     dispatch[types.FunctionType] = save_function
@@ -250,7 +272,8 @@ class _Pickler(pickle._Pickler):
                 ctypes.pythonapi.PyCell_Get, (1,
                     ctypes.py_object, (0, obj.cell_contents)
                 )
-            )
+            ),
+            (0, ctypes.py_object)
         )
     dispatch[cell] = save_cell
 
@@ -266,11 +289,19 @@ class _Pickler(pickle._Pickler):
          c.co_lnotab, c.co_freevars, c.co_cellvars)
     )
 
+    # pickle functions from arbitrary CDLLs
+    def _ctypes_FuncPtr(name):
+        basename = name + '.'
+        p= lambda f: basename + f.__name__
+        p.__name__ = "pickle_ctypes_{}_FuncPtr".format(name)
+        return p
+    dispatch_table[ctypes.pythonapi._FuncPtr] = _ctypes_FuncPtr('pythonapi')
 
 def whichmodule(obj, name):
-    if obj in resolvable_location:
-        # resolvable_location[obj][1] should == name
-        return resolvable_location[obj][0]
+    location = resolve_location(obj)
+    if location is not None:
+        # resolvable_location(obj)[1] should == name
+        return location[0]
     return pickle.whichmodule(obj, name)
 
 # Shorthands
