@@ -13,6 +13,8 @@ PickleError = pickle.PickleError
 PicklingError = pickle.PicklingError
 UnpicklingError = pickle.UnpicklingError
 Unpickler = pickle.Unpickler
+load = pickle.load
+loads = pickle.loads
 
 # Get references to types without any __qualname__-like reference
 def closure_container(x=None):
@@ -85,7 +87,6 @@ _resolvable_location = {
     types.ModuleType: ('types', 'ModuleType'),
     types.TracebackType: ('types', 'TracebackType'),
     functools._CacheInfo: ('functools', '_CacheInfo'),
-    ctypes.pythonapi._FuncPtr: ('ctypes', 'pythonapi._FuncPtr'),
 }
 
 def resolve_location(obj):
@@ -177,10 +178,12 @@ class _Pickler(pickle._Pickler):
         else:
             # End a variable-length tuple
             self.write(TUPLE)
+        self.write(REDUCE)  # Call the function
 
     def save_type(self, obj):
         # save_type is called to save all instances of type.
         # This includes the types.XyzType types.
+        # It does not include classes with a different metaclass.
         
         # I'm implementing this here, as opposed to in separate
         # dispatches, because the types need to be implemented anyway
@@ -209,10 +212,9 @@ class _Pickler(pickle._Pickler):
         if obj.__module__ in ('ctypes',):
             try:
                 self.save_global(obj)
+                return
             except PicklingError:
-                print("ASSUMPTION IN save_function({}) FAILED!".format(obj))
                 pass
-            return
         
         func = types.FunctionType
         if self.proto >= 2:
@@ -268,12 +270,14 @@ class _Pickler(pickle._Pickler):
 
     def save_cell(self, obj):
         self.save_function_call(
-            ctypes.cast, (1,
-                ctypes.pythonapi.PyCell_Get, (1,
-                    ctypes.py_object, (0, obj.cell_contents)
-                )
-            ),
-            (0, ctypes.py_object)
+            getattr, (1,
+                ctypes.cast, (1,
+                    ctypes.pythonapi.PyCell_New, (1,
+                        ctypes.py_object, (0, obj.cell_contents)
+                    )
+                ),
+                (0, ctypes.py_object)
+            ), (0, "value")
         )
     dispatch[cell] = save_cell
 
@@ -296,6 +300,7 @@ class _Pickler(pickle._Pickler):
         p.__name__ = "pickle_ctypes_{}_FuncPtr".format(name)
         return p
     dispatch_table[ctypes.pythonapi._FuncPtr] = _ctypes_FuncPtr('pythonapi')
+    dispatch_table[ctypes.PyDLL] = lambda d: "pythonapi"
 
 def whichmodule(obj, name):
     location = resolve_location(obj)
@@ -304,22 +309,52 @@ def whichmodule(obj, name):
         return location[0]
     return pickle.whichmodule(obj, name)
 
+class DebugUnpickler(pickle._Unpickler):
+    """Only exists for debugging porpoises.
+
+    Do NOT attempt to debug other mammals."""
+    def load(self):
+        try:
+            super().load()
+        except AttributeError:
+            # Hijacked. Yay!
+            pass
+
+        from code import InteractiveConsole
+        
+        while True:
+            try:
+                key = self.read(1)
+                print("Executing", next(k for k, v in vars(pickle).items()
+                                        if v == key), end='')
+                if not key:
+                    raise EOFError
+                self.dispatch[key[0]](self)
+                if input():
+                    InteractiveConsole(locals=locals()).interact(banner="")
+            except pickle._Stop as stopinst:
+                print()
+                InteractiveConsole(locals=locals()).interact(banner="Stopped!")
+
+    def __getattribute__(self, key):
+        if key == "read":
+            import inspect
+            frame = inspect.stack()[1]
+            if frame.function == "load" and frame.filename == pickle.__file__:
+                raise AttributeError("Stop load from running!")
+        return super().__getattribute__(key)
+            
 # Shorthands
 _dump = _duplicate(pickle._dump)
 _dumps = _duplicate(pickle._dumps)
-_load = _duplicate(pickle._load)
-_loads = _duplicate(pickle._loads)
 
 # Use the faster _pickall if I ever get around to writing it
-# Use the faster _pickle if possible
 try:
     from _pickall import (
         Pickler,
         dump,
         dumps,
-        load,
-        loads
     )
 except ImportError:
     Pickler = _Pickler
-    dump, dumps, load, loads = _dump, _dumps, _load, _loads
+    dump, dumps = _dump, _dumps
