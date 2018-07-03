@@ -1,6 +1,55 @@
 import unittest
+import doctest
 import pickall
 import pickle
+
+# Utilities
+class UnitTestDocTestRunner(doctest.DocTestRunner):
+    def __init__(self, checker=None, optionflags=0, *args,
+                 unittest_testcase, **kwargs):
+        super().__init__(checker, False, optionflags, *args, **kwargs)
+        self.unittest_testcase = unittest_testcase
+        self._unittest_subtest = None
+
+    def report_start(self, out, test, example):
+        assert self._unittest_subtest is None
+        self._unittest_subtest = self.unittest_testcase.subTest(
+            out=out, test=test, example=example)
+        self._unittest_subtest.__enter__()
+
+    def report_success(self, out, test, example, got):
+        self._unittest_subtest.__exit__(None, None, None)
+        self._unittest_subtest = None
+
+    def report_failure(self, out, test, example, got):
+        self.unittest_testcase.assertEqual(example.want, got)
+        self._unittest_subtest.__exit__(None, None, None)
+        self._unittest_subtest = None
+
+    def report_unexpected_exception(self, out, test, example, exc_info):
+        self._unittest_subtest.__exit__(*exc_info)
+        self._unittest_subtest = None
+    
+
+# Backwards- (pickle-)compatibility
+class DoctestTestCase(unittest.TestCase):
+    def test_all(self):
+        """Tests nothing; here for completeness only."""
+        tests = [
+            test
+            for name in pickle.__all__
+            for test in doctest.DocTestFinder().find(getattr(pickle, name),
+                                                     name)
+        ]
+
+        runner = UnitTestDocTestRunner(unittest_testcase=self)
+        for test in tests:
+            test.globs = vars(pickall).copy()
+            runner.run(test)
+
+class ImportTestCase(unittest.TestCase):
+    def test_star(self):
+        exec("from pickall import *")
 
 # Documented
 class FunctionPicklingTestCase(unittest.TestCase):
