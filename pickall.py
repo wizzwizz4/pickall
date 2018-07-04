@@ -7,6 +7,7 @@ import functools
 import copyreg
 import ctypes
 import sys
+import weakref
 
 # Ensure that pickall has the same interface as pickle
 __all__ = pickle.__all__
@@ -88,6 +89,8 @@ _resolvable_location = {
     types.ModuleType: ('types', 'ModuleType'),
     types.TracebackType: ('types', 'TracebackType'),
     functools._CacheInfo: ('functools', '_CacheInfo'),
+    re._pattern_type: ('re', '_pattern_type'),
+    weakref.ref: ('weakref', 'ref'),
 }
 
 def resolve_location(obj):
@@ -330,6 +333,14 @@ class _Pickler(pickle._Pickler):
         )
     dispatch[cell] = save_cell
 
+    def save_compiled_regex(self, obj):
+        self.save_function_call(
+            re._compile,
+            (0, obj.pattern),
+            (0, obj.flags)
+        )
+    dispatch[re._pattern_type] = save_compiled_regex
+
     # dispatch_table is a registry of reduction functions
     dispatch_table = _ChainedDictionary(copyreg.dispatch_table)
 
@@ -341,6 +352,11 @@ class _Pickler(pickle._Pickler):
         return p
     dispatch_table[ctypes.pythonapi._FuncPtr] = _ctypes_FuncPtr('pythonapi')
     dispatch_table[ctypes.PyDLL] = lambda d: "pythonapi"
+
+    # sys
+    dispatch_table[sys.version_info.__class__] = lambda v: "version_info"
+    dispatch_table[sys.thread_info.__class__] = lambda t: "thread_info"
+    dispatch_table[sys.hash_info.__class__] = lambda h: "hash_info"
 
     # dispatch_singletons is documented in save
     # It's like dispatch, but for singletons and using ids as keys.
